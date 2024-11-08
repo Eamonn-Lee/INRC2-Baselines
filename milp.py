@@ -1,21 +1,16 @@
 from pyomo.environ import *
-import re
-from interface import getInstance, milp
 import sys
-
+from interface import getInstance, milp
 instance = milp(getInstance(sys.argv[1]))
-print(instance)
-
-
 
 # Define the model
 model = ConcreteModel()
 
 # Define parameters
 nurses = ['Alice', 'Bob', 'Charlie']
-days = range(1, 8)  # A one-week period
-shifts = ['Morning', 'Evening', 'Night']
-skills = ['HeadNurse', 'Nurse']
+days = range(1, 8)  # A one-week period (1 for Monday, 2 for Tuesday, etc.)
+shifts = ['Early', 'Day', 'Late', 'Night']
+skills = ['HeadNurse', 'Nurse', 'Caretaker', 'Trainee']
 
 # Set of indices
 model.N = Set(initialize=nurses)  # Nurses
@@ -26,96 +21,61 @@ model.SK = Set(initialize=skills) # Skills
 # Decision variable: x[n,d,s,sk] = 1 if nurse n works shift s on day d with skill sk, else 0
 model.x = Var(model.N, model.D, model.S, model.SK, within=Binary)
 
-# Auxiliary slack variables to represent unmet staffing requirements
+# Auxiliary slack and excess penalty variables
 model.slack = Var(model.D, model.S, model.SK, within=NonNegativeReals)
+model.excess_penalty = Var(model.D, model.S, model.SK, within=NonNegativeReals)
+model.shift_off_penalty = Var(within=NonNegativeReals)
 
-# Parameters: staffing requirements, nurse skills, preferences
+# Coverage requirements based on the provided specification
 min_staffing = {
-    (1, 'Morning', 'HeadNurse'): 1,
-    (1, 'Morning', 'Nurse'): 2,
-    # Extend this for all days and shifts...
+    ('Early', 'HeadNurse', 1): (1, 1),  # Minimum and optimal coverage for Monday Early HeadNurse
+    ('Early', 'Nurse', 1): (1, 1),
+    ('Early', 'Caretaker', 1): (2, 3),
+    ('Early', 'Trainee', 1): (0, 1),
+    # Continue for each shift, skill, and day...
+    ('Night', 'Trainee', 7): (1, 1),
 }
-nurse_skills = {
-    'Alice': ['HeadNurse', 'Nurse'],
-    'Bob': ['Nurse'],
-    'Charlie': ['Nurse'],
+
+# Shift-off requests
+shift_off_requests = {
+    ('CT_18', 'Day', 'Tue'): 1,
+    ('CT_27', 'Any', 'Tue'): 1,
+    ('HN_3', 'Any', 'Tue'): 1,
+    ('HN_3', 'Any', 'Thu'): 1,
+    ('NU_14', 'Night', 'Thu'): 1,
+    ('TR_36', 'Any', 'Thu'): 1,
+    # Continue for all requests as specified...
 }
-preferences = {('Alice', 1, 'Morning'): 1}  # Example preference to avoid working a specific shift
 
-# Define shift_sequences as a parameter
-shift_sequences_data = {
-    ('Morning', 'Evening'): 1,
-    ('Morning', 'Night'): 1,
-    ('Evening', 'Morning'): 1,
-    ('Night', 'Morning'): 1,
-}
-model.shift_sequences = Param(model.S, model.S, initialize=shift_sequences_data, default=0)
-
-# Skill Constraint: Only assign skills a nurse has
-def skill_constraint(model, n, d, s, sk):
-    if sk not in nurse_skills[n]:
-        return model.x[n, d, s, sk] == 0
+# Minimum staffing requirement with slack
+def min_staffing_rule(model, d, s, sk):
+    if (s, sk, d) in min_staffing:
+        min_req, _ = min_staffing[(s, sk, d)]
+        return sum(model.x[n, d, s, sk] for n in model.N) + model.slack[d, s, sk] >= min_req
     return Constraint.Skip
-model.skill_constraint = Constraint(model.N, model.D, model.S, model.SK, rule=skill_constraint)
+model.min_staffing = Constraint(model.D, model.S, model.SK, rule=min_staffing_rule)
 
-# Single Assignment Per Day
-def single_assignment_rule(model, n, d):
-    return sum(model.x[n, d, s, sk] for s in model.S for sk in model.SK) <= 1
-model.single_assignment = Constraint(model.N, model.D, rule=single_assignment_rule)
-
-# Staffing Requirement with Slack
-def staffing_rule(model, d, s, sk):
-    if (d, s, sk) in min_staffing:
-        return sum(model.x[n, d, s, sk] for n in model.N) + model.slack[d, s, sk] >= min_staffing[d, s, sk]
+# Optimal staffing requirement with excess penalty
+def opt_staffing_rule(model, d, s, sk):
+    if (s, sk, d) in min_staffing:
+        _, opt_req = min_staffing[(s, sk, d)]
+        return sum(model.x[n, d, s, sk] for n in model.N) - model.excess_penalty[d, s, sk] <= opt_req
     return Constraint.Skip
-model.staffing = Constraint(model.D, model.S, model.SK, rule=staffing_rule)
+model.opt_staffing = Constraint(model.D, model.S, model.SK, rule=opt_staffing_rule)
 
-# Shift Type Successions: Enforce allowed shift sequences
-def shift_succession_rule(model, n, d, s1, s2):
-    if model.shift_sequences[s1, s2] == 0:
-        if d < max(days):  # Ensure it's within the range of days
-            return model.x[n, d, s1, 'Nurse'] + model.x[n, d + 1, s2, 'Nurse'] <= 1
-    return Constraint.Skip
-model.shift_succession = Constraint(model.N, model.D, model.S, model.S, rule=shift_succession_rule)
+# Shift-off requests penalty
+def shift_off_request_penalty(model):
+    return model.shift_off_penalty >= sum(
+        model.x[n, d, s, sk] * shift_off_requests.get((n, s, d), 0)
+        for n in model.N for d in model.D for s in model.S for sk in model.SK
+    )
+model.shift_off_request_penalty = Constraint(rule=shift_off_request_penalty)
 
-# Consecutive Assignments: Max consecutive working days
-max_consecutive_work = 5  # Set based on INRC-II requirements
-def consecutive_work_rule(model, n, d):
-    if d <= len(days) - max_consecutive_work:
-        return sum(model.x[n, d + i, s, 'Nurse'] for i in range(max_consecutive_work) for s in model.S) <= max_consecutive_work
-    return Constraint.Skip
-model.consecutive_work = Constraint(model.N, model.D, rule=consecutive_work_rule)
-
-# Consecutive Days Off: Minimum number of days off after max working days
-min_days_off = 2
-def consecutive_days_off_rule(model, n, d):
-    if d <= len(days) - min_days_off:
-        return sum(1 - sum(model.x[n, d + i, s, 'Nurse'] for s in model.S) for i in range(min_days_off)) >= min_days_off
-    return Constraint.Skip
-model.consecutive_days_off = Constraint(model.N, model.D, rule=consecutive_days_off_rule)
-
-# Preferences: Penalize unwanted assignments
-model.pref_penalty = Var(within=NonNegativeReals)
-def preferences_rule(model):
-    return model.pref_penalty >= sum(model.x[n, d, s, 'Nurse'] * preferences.get((n, d, s), 0) for n in model.N for d in model.D for s in model.S)
-model.preferences = Constraint(rule=preferences_rule)
-
-# Complete Weekend: Either work both days or none in a weekend
-def complete_weekend_rule_1(model, n):
-    # Ensure that if a nurse works Saturday, they must also work Sunday
-    return model.x[n, 6, 'Morning', 'Nurse'] <= model.x[n, 7, 'Morning', 'Nurse']
-
-def complete_weekend_rule_2(model, n):
-    # Ensure that if a nurse works Sunday, they must also work Saturday
-    return model.x[n, 7, 'Morning', 'Nurse'] <= model.x[n, 6, 'Morning', 'Nurse']
-
-# Add these two constraints to enforce the complete weekend requirement
-model.complete_weekend_1 = Constraint(model.N, rule=complete_weekend_rule_1)
-model.complete_weekend_2 = Constraint(model.N, rule=complete_weekend_rule_2)
-
-# Objective: Minimize slack and preferences penalty
+# Objective Function: Minimize slack, excess penalties, and shift-off penalties
 model.obj = Objective(
-    expr=sum(model.slack[d, s, sk] for d in model.D for s in model.S for sk in model.SK) + model.pref_penalty,
+    expr=sum(model.slack[d, s, sk] for d in model.D for s in model.S for sk in model.SK) +
+         sum(model.excess_penalty[d, s, sk] for d in model.D for s in model.S for sk in model.SK) +
+         model.shift_off_penalty,
     sense=minimize
 )
 
