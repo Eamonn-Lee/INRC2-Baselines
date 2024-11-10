@@ -1,5 +1,5 @@
 import os
-import re
+import pprint
 
 INRC2_DIR = "datasets/INRC2/"
 
@@ -32,7 +32,7 @@ def getInstance(instance_name):
 
     weekfiles = []
     for num in weeks:
-        file_path = f"datasets/INRC2/{str(arg[0])}/{str(week(arg[0], num))}"
+        file_path = f"{str(week(arg[0], num))}"
 
         weekfiles.append(file_path)
 
@@ -96,7 +96,48 @@ def week_req(line):
     return min_staffing
 
 
-        
+def weeks2day_schedule(weeklist):
+    schedule_dict = {}
+
+    # Process each week's data
+    for week_index, week_data in enumerate(weeklist):
+        for entry in week_data:
+            # Split the entry into shift/role and the tuples
+            parts = entry.split(" ")
+            
+            # Extract shift_time and role correctly from the parts
+            shift_time = parts[0]
+            role = " ".join(parts[1:-7])  # Join all parts up to the tuples as role
+            
+            # Convert each value in values to a tuple and add to the dictionary
+            for day_index, value in enumerate(parts[-7:]):
+                # Convert the string (x,y) to a tuple (int, int)
+                count_tuple = tuple(map(int, value.strip("()").split(",")))
+                # Create the dictionary key as (shift_time, role, day_out_of_total_weeks)
+                key = (shift_time, role, week_index * 7 + day_index + 1)
+                schedule_dict[key] = count_tuple
+
+    return schedule_dict
+
+def off2day_schedule(data):
+    day_mapping = {
+        'Mon': 0,
+        'Tue': 1,
+        'Wed': 2,
+        'Thu': 3,
+        'Fri': 4,
+        'Sat': 5,
+        'Sun': 6
+    }
+    combined_shift_offs = []
+    for week_index, week in enumerate(data):
+        for shift in week:
+            role, shift_type, day = shift.split()
+            integer_day = week_index * 7 + day_mapping[day] + 1
+            combined_shift_offs.append((role, shift_type, integer_day))
+    combined_shift_offs_dict = {shift_off: 1 for shift_off in combined_shift_offs}
+    return combined_shift_offs_dict
+
 def milp(instance):
 
 #import sys
@@ -139,6 +180,8 @@ def milp(instance):
         i+=1
 
     #weeks -----------------
+    week_list = []
+    off_list = []
     for week in instance["weeks"]:
         with open(week, 'r') as f:
             lines = f.readlines()
@@ -147,23 +190,26 @@ def milp(instance):
         i = 0
         while i < len(lines):
             line = lines[i].strip()
-            if line.startswith("REQUIREMENTS"):
+            if line.startswith("REQUIREMENTS"): #only triggers once
                 week_shifts = [lines[i+j+1].strip() for j in range(expected_entries)]
+                week_list.append(week_shifts)
 
             elif line.startswith("SHIFT_OFF_REQUESTS"):
                 n_off = int(line.split('=')[1].strip())
                 shift_off = [lines[i+j+1].strip() for j in range(n_off)]
-
+                off_list.append(shift_off)
+            i+=1
 
     sc = {
         "days" : 28 if (n_weeks == "4") else 56,
         "skills" : skills,
         "shifts" : shift_types, #not sure
         "shift_seq": shift_sequences,
-        "nurse" : nurses
+        "nurse" : nurses,
+        "week_shifts" : weeks2day_schedule(week_list),
+        "shift_off" : off2day_schedule(off_list)
     }
     
-    print(sc)
 
     return sc
 
